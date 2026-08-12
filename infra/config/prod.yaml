@@ -1,0 +1,38 @@
+env_name: prod
+# Use a model package group name that is unique across environments.
+# Dev and prod deploy into the same account.
+model_package_group: churn-model-group-prod
+model_approval_status: PendingManualApproval
+endpoint_name: churn-serverless-prod
+pipeline_name: churn-training-pipeline-prod
+serverless:
+  memory_mb: 3072
+  max_concurrency: 20
+monitor:
+  # This hourly schedule starts about 720 SageMaker processing jobs each month.
+  schedule_cron: "cron(0 * ? * * *)"
+  # Page after this many hours with no endpoint invocations.
+  silence_alarm_hours: 6
+
+# This value is inactive while `security.account_budget` is false.
+budget_usd: 20
+log_retention_days: 14
+# Expire captured predictions after this many days.
+# No other artifact prefix uses expiration.
+capture_retention_days: 30
+security:
+  audit_log_retention_days: 90
+  budget_thresholds: [50, 80, 100]
+  # Keep this flag false while dev owns the account-wide budget.
+  account_budget: false
+  services:
+    access_analyzer: false
+    guardduty: false
+    config_recorder: false
+    security_hub: false
+    account_bpa: false
+    eventbridge_alerts: false
+cicd:
+  github_repository: emanuelGitCodes/aws-mlops-platform-public
+  # Keep this flag false while dev owns the account-wide OIDC provider.
+  owns_oidc_provider: false
