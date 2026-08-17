@@ -1,0 +1,23 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+cdk.out/
+.pytest_cache/
+.ruff_cache/
+.coverage
+.mypy_cache/
+*.egg-info/
+.env
+data/
+telco/
+.DS_Store
+graphify-out/
+
+# Impeccable design-hook cache. Build output, never source.
+.impeccable/hook.cache.json
+.claude/settings.local.json
+
+# Frontend build output and installed packages.
+website/frontend/node_modules/
+website/frontend/dist/

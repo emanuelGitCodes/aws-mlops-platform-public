@@ -1,0 +1,62 @@
+version: 2
+
+# Dependabot updates locked Python dependencies and pinned GitHub Actions.
+updates:
+  # Update Python dependencies through the `uv` ecosystem.
+  # Keep `uv.lock` synchronized with `pyproject.toml`.
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    # Update the lockfile within the declared version constraints.
+    # Change `sagemaker` and `cdk-nag` constraints in separate pull requests.
+    versioning-strategy: "lockfile-only"
+    # Group related packages. Keep the transitive catch-all group last.
+    groups:
+      # Update CDK, jsii, constructs, and cdk-nag together.
+      aws-cdk:
+        patterns:
+          - "aws-cdk*"
+          - "constructs"
+          - "cdk-nag"
+          - "jsii"
+      # Update the SageMaker pipeline runtime as one group.
+      pipeline-runtime:
+        patterns:
+          - "sagemaker"
+          - "sagemaker-core"
+          - "pandas"
+          - "scikit-learn"
+          - "matplotlib"
+          - "xgboost"
+      # Update boto3, botocore, and their type stubs together.
+      boto3:
+        patterns:
+          - "boto3*"
+          - "botocore"
+          - "s3transfer"
+          - "mypy-boto3-*"
+      # Update lint, type, test, and audit tools together.
+      dev-tooling:
+        patterns:
+          - "ruff"
+          - "mypy"
+          - "pytest*"
+          - "pip-audit"
+          - "types-*"
+      transitive:
+        patterns:
+          - "*"
+
+  # Update SHA-pinned GitHub Actions and their version comments monthly.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 3
+    groups:
+      github-actions:
+        patterns:
+          - "*"
