@@ -2,14 +2,67 @@
 
 import hashlib
 import json
+import re
+from unittest import mock
 
 import aws_cdk as cdk
 import pytest
 from aws_cdk.assertions import Match
+from cdk_nag import AwsSolutionsChecks
 
-from infra.app import load_config, stack_prefix
+from infra.app import build_app, load_config, stack_prefix
 from infra.security_checks import acknowledgement_metadata_key, resolved_acknowledgements
 from tests.unit.conftest import CONFIG, synth_env
+
+
+def test_acknowledgements_match_live_cdk_nag_findings():
+    """Require each active acknowledgement to match a live cdk-nag finding."""
+    app = cdk.App(
+        context={
+            "aws:cdk:bundling-stacks": [],
+            "@aws-cdk/aws-s3:serverAccessLogsUseBucketPolicy": True,
+        }
+    )
+    with mock.patch("infra.app.apply_security_checks"):
+        stacks = build_app(app, CONFIG, "Test")
+
+    app.synth()
+    report = AwsSolutionsChecks(app, verbose=False).validate_scope(app)
+
+    def canonical_finding_id(finding_id: str) -> str:
+        finding_id = finding_id.removeprefix("AwsSolutions::")
+        return re.sub(
+            r"Test-Data:ExportsOutputFnGetAtt([A-Za-z0-9]+)Arn[A-F0-9]+",
+            r"<\1.Arn>",
+            finding_id,
+        )
+
+    live_pairs = {
+        (resource.construct_path, canonical_finding_id(violation.rule_name))
+        for violation in report.violations
+        for resource in violation.violating_resources
+    }
+    service_flags = CONFIG["security"]["services"]
+    enabled_flags = {name for name, enabled in service_flags.items() if enabled}
+    if CONFIG["security"]["account_budget"]:
+        enabled_flags.add("account_budget")
+    if CONFIG["website"]["enabled"]:
+        enabled_flags.add("website")
+
+    expected_pairs = set()
+    for acknowledgement in resolved_acknowledgements(CONFIG, "Test"):
+        if acknowledgement.requires_flag and acknowledgement.requires_flag not in enabled_flags:
+            continue
+        stack = stacks[acknowledgement.stack]
+        expected_path = f"{stack.node.path}/{acknowledgement.construct_path}"
+        matches = [node for node in stack.node.find_all() if node.node.path == expected_path]
+        assert len(matches) == 1, expected_path
+        target = matches[0].node.default_child or matches[0]
+        pair = target.node.path, canonical_finding_id(acknowledgement.finding_id)
+        expected_pairs.add(pair)
+
+    missing_pairs = sorted(expected_pairs - live_pairs)
+    assert not missing_pairs, missing_pairs
 
 
 def test_security_acknowledgements_are_exact_and_expiring(stack_constructs):
@@ -112,14 +165,14 @@ def test_iam_policy_baseline_has_not_changed(stacks):
         "security": "9925908b0ff292a103399b71a26a17717dccd31daf542493a0723645d056dd24",
         "security_monitoring": "9815f466b4c436c348c80a636d5099b644e77e52c2d0f5c8041df0f35d89a17a",
         "data": "2939699d4ec8219e7af89d0bc03ac579b55c02c28f638d251fe25296fd6b67c1",
-        "ingestion": "c8b076e8f8204d2bd8934a16fd3a5908676338b6e39b62181beb204ef3486f90",
+        "ingestion": "564dd6a14d4daa9e28c43c51b408dd33813e11bcdbaa6b51732bae3dc1dda4b2",
         "registry": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
         # Keep the pipeline role logical id unchanged.
-        "training": "38c16b61765d1ad0a1f8dede12c2af664eb508af0cdcc5fd97e38780154a4574",
+        "training": "69aa221901f5836abed23335c0cad335c49182053310f72e3a64a28f5b92c4f5",
         # Keep the model role logical id unchanged.
-        "serving": "df36151514116565e7ad6d73e8185b530945a329fa1c3454273da7d0bbc04eb3",
+        "serving": "fcb7f599b4b0fff119999d1897761dc1088d1b8268761bc19a5c9c4ef048a2d9",
         # Track both monitoring Lambda roles.
-        "monitoring": "3444854868fba5e089e04e4e55706b51c947cf883cc435e5a759831869a5b243",
+        "monitoring": "4b38f1c4825eddf344b48b8ca962af2847c8fe53d4f08162e53d459d6619c459",
         # Track the deploy role permissions and OIDC trust conditions.
         "cicd": "7a803ee795eea06da566236a0a25ed949c54dcd570d3cb33b8ebcea10ef4b81d",
         # Track the website instance role and its scoped grants.

@@ -9,14 +9,24 @@ cdk.out/
 .mypy_cache/
 *.egg-info/
 .env
+.env.*
+!.env.example
 data/
 telco/
 .DS_Store
 graphify-out/
 
-# Impeccable design-hook cache. Build output, never source.
-.impeccable/hook.cache.json
-.claude/settings.local.json
+# Private agent and design workflows.
+.agents/
+.claude/
+.codex/
+.impeccable/
+
+# Private key and certificate files.
+*.key
+*.pem
+*.p12
+*.pfx
 
 # Frontend build output and installed packages.
 website/frontend/node_modules/

@@ -22,12 +22,14 @@ This is the content map. Read it first, then follow the most relevant links.
 
 ## Concepts
 
-- [Closed drift-to-retrain loop](pages/concepts/closed-drift-loop.md) — Proxy capture, PSI drift evaluation, retraining, challenger evaluation, registry promotion, and endpoint deployment form a closed operational loop.
+- [Closed drift-to-retrain loop](pages/concepts/closed-drift-loop.md) — A repository-owned drift loop captures live inputs, compares models on common held-out rows, binds baselines to the serving package, and gates promotion.
 - [Validation versus preprocessing contracts](pages/concepts/contracts-and-preprocessing.md) — Validation checks whether a record is acceptable; preprocessing deterministically converts an accepted record into the model's numeric feature vector.
 
 ## Decisions
 
+- [Audit repair readiness and dev release gate](pages/decisions/audit-repair-readiness.md) — The audit repairs and serving retry protection pass local gates, but dev release waits for serving-package baseline metadata and provenance checks.
 - [Dataset provenance and the untracked CSV](pages/decisions/dataset-provenance.md) — The Telco churn CSV stays untracked and is pinned by SHA-256 to the public IBM/Kaggle file, because the seeded split makes every downstream metric depend on the exact row order.
+- [Dev deployment check on 2026-09-05](pages/decisions/dev-deployment-check-2026-09-05.md) — Five dev stacks updated successfully and six API checks passed; pipeline publication and baseline migration remain blocked.
 - [Drift capture design for a serverless endpoint](pages/decisions/drift-capture-design.md) — Model Monitor is closed to new customers, so the deferred capture leg is rebuilt as a repository-owned drift job rather than restored; the serverless endpoint and its zero idle cost stay.
 - [graphify code graph beside the wiki](pages/decisions/graphify-knowledge-graph.md) — graphify indexes the tree into a disposable, untracked code graph, and the wiki keeps its role as the source of record for history, decisions, and status.
 - [Paid Phase 3 security services — GuardDuty cost and timing](pages/decisions/phase-3-paid-security-services.md) — GuardDuty costs roughly a dollar a month here and is approved, but deliberately waits for the planned EC2 and load-balancer website, where its detections finally apply.

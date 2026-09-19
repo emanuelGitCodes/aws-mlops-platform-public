@@ -895,6 +895,294 @@ until the Data-to-Serving export-removal blocker has a reviewed remediation.
 
 Found 17 matching page(s).
 
+## [2026-09-05] implement | Operational stall and endpoint failure alerts
+
+**Objective:** notify the operator when retraining stops without progress or
+the serving endpoint enters a failure state.
+
+**Scope:** Monitoring and Serving stack definitions and their regression tests.
+The new alarm uses the retrain function's log group and the operational topic.
+The endpoint rule matches the configured endpoint name, ARN, and failure states.
+
+**Identity and environment:** local checkouts only. No AWS deployment or
+permission change was performed.
+
+**Commands and results:** the isolated alert checkout passed `make check`
+with 542 tests and 95.47% coverage. `make synth-all` passed for dev and prod.
+`make pr-size` measured 58 of 150 source lines against the original base.
+
+**Interpretation:** local tests verify filter shape, resource scope, and
+notification routing. They do not prove event delivery or received email.
+
+**Decision and next checkpoint:** prepared for local review. A scoped dev
+deployment and controlled notification tests remain pending. This is not an
+observation-window go decision.
+
+## [2026-09-05] implement | Curated replacement and baseline validation
+
+**Objective:** prevent stale training rows and invalid drift baselines from
+being reported as successful work.
+
+**Scope:** the ingestion handler, shared drift validation, drift reader,
+Ingestion IAM grants, and regression tests. Readable uploads with no valid
+rows remove the prior curated object. Unreadable uploads still fail without
+deleting the previous validated data.
+
+**Identity and environment:** local checkouts only. No AWS operation changed
+data or permissions.
+
+**Commands and results:** the isolated change passed `make check` with
+551 tests and 95.26% coverage. `make synth-all` passed for dev and prod.
+The initial full check caught the changed ingestion IAM fingerprint.
+The fingerprint was updated only after checking the exact `telco/*` and
+`quarantine/*` delete resources. `make pr-size` measured 81 of 150 source lines.
+
+**Interpretation:** baseline validation now checks the complete feature
+contract, distribution totals, numeric bins, and category values. Both the
+S3 reader and direct comparisons use the same validator.
+
+**Decision and next checkpoint:** prepared for local review. Scoped deployment
+and an upload replacement test in dev remain pending. No observation window
+is closed by these local tests.
+
+## [2026-09-05] implement | Preprocessing and evaluation tool correctness
+
+**Objective:** reject unusable datasets before artifact writes and make
+evaluation commands use the selected identities and thresholds.
+
+**Scope:** preprocessing, evaluation charts, the API evaluator, the smoke
+target, and regression tests. Valid canonical splits retain their row mapping.
+A deterministic fallback preserves both classes when the input permits it.
+The writer rejects inputs that cannot support all three splits.
+
+**Identity and environment:** local checkouts and mocked commands only.
+No AWS permission was changed and no live prediction was invoked.
+
+**Commands and results:** the isolated change passed `make check` with
+549 tests and 95.29% coverage. `make pr-size` measured 118 of 150 source lines.
+Tests cover the threshold marker, fixture-read sessions, an explicit read
+profile, an API URL override, and separated discovery and signing profiles.
+
+The first combined check passed 562 tests but failed the unchanged coverage
+floor at 95.12%. Four additional boundary tests cover invalid external splits
+and the minimum dataset size. The combined `make check` then passed 566 tests
+at 95.34% coverage. The floor remains 95.17%.
+
+**Interpretation:** `make smoke` can skip CloudFormation discovery when given
+an API URL. The evaluator uses its selected session for all reads unless the
+operator supplies a separate read profile. These paths do not grant access.
+
+**Decision and next checkpoint:** prepared for local review. A test identity
+with the needed inference and fixture-read grants remains a live prerequisite.
+
+## [2026-09-05] implement | Serving-baseline read prerequisites
+
+**Objective:** prepare the drift role to resolve the model that the endpoint
+actually serves and read that model's execution-specific baseline.
+
+**Scope:** shared baseline metadata names, Monitoring environment values,
+scoped read grants, cdk-nag acknowledgements, and regression tests.
+This change does not activate the new reader.
+
+**Identity and environment:** local checkouts only. No AWS grants were installed.
+
+**Commands and results:** the combined `make check` passed 568 tests.
+The isolated prerequisite change passed `make synth-all` for dev and prod.
+Permission tests bind each Describe action to its endpoint, configuration,
+model, or model-package ARN type. Only the monitoring fingerprint changed.
+
+**Interpretation:** the role can describe this endpoint and its generated
+resources. The new S3 read is limited to `monitor/baselines/*` in the
+artifacts bucket. It adds no write or training permission.
+
+**Decision and next checkpoint:** prepared for local review. The producer and
+reader changes follow in the local stack. Model metadata migration and a
+scoped dev deployment remain pending.
+
+## [2026-09-05] implement | Compare models on the same held-out rows
+
+**Objective:** prevent historical champion scores from controlling a comparison
+against a different test population.
+
+**Scope:** evaluation, pipeline definition, CLI start parameters, and tests.
+Evaluation loads the approved model artifact and scores both models on the
+same feature rows. The gate reads the newly computed champion AUC.
+Archive loading reads only the regular `xgboost-model` member.
+
+**Identity and environment:** local checkouts and a local Docker runtime.
+No AWS training, deployment, or model approval was performed.
+
+**Commands and results:** the combined `make check` passed 580 tests at
+96.04% coverage. `make pr-size` measured 124 of 150 source lines.
+A local XGBoost 1.7.6 exercise used all 7,043 canonical rows with unchanged
+4,930/1,056/1,057 splits. The two early-stopped models each produced AUC
+0.838232 and accuracy 0.795648. The equal-score challenger was rejected.
+
+**Interpretation:** local tests verify comparison arithmetic, safe artifact
+loading, same-row scoring, and the strict gate. Preprocessing and training
+caches are disabled because the curated input prefix can change in place.
+The CLI refreshes champion parameters after upsert.
+
+**Decision and next checkpoint:** prepared for local review. Runtime champion
+selection for arbitrary unparameterized starts follows in another small
+change. Live pipeline execution and endpoint evaluation remain pending.
+
+## [2026-09-05] implement | Bind drift baselines to the serving model
+
+**Objective:** prevent a rejected candidate from replacing the reference
+distribution used to monitor the serving model.
+
+**Scope:** execution-specific baseline output, model-package metadata,
+the drift reader, and regression tests. The reader resolves the endpoint,
+configuration, model, and package before reading that package's baseline URI.
+It rechecks endpoint state and configuration before publishing a result.
+
+**Identity and environment:** local tests used mocked service clients.
+A separate read-only dev query confirmed that the current serving package
+has `test_auc` metadata but no `baseline_uri` key.
+
+**Commands and results:** the combined `make check` passed 598 tests at
+96.14% coverage. `make pr-size` measured 147 of 150 source lines.
+The isolated change passed dev and prod synthesis. Tests cover current-model
+selection, missing metadata, URI scope, malformed baselines, transitional
+states, and a model change during evaluation.
+
+**Interpretation:** no deployment callback copies a candidate baseline into
+the active reference. Each execution writes its own object. Missing legacy
+metadata is an explicit failure, not permission to use an unverified baseline.
+
+**Decision and next checkpoint:** prepared for local review. Before activating
+the new reader in dev, bind a verified training baseline to the serving model
+or deploy a compatible approved package. Do not label the current shared
+baseline as verified without checking its training provenance.
+
+## [2026-09-05] implement | Resolve the champion during evaluation
+
+**Objective:** prevent an unparameterized pipeline start from using a stale
+model-package default.
+
+**Scope:** evaluation-time registry lookup, pipeline arguments, Training IAM,
+input-file ordering, and regression tests. The pipeline supplies its configured
+model package group. Evaluation resolves the latest approved package before
+loading its artifact. Direct evaluator calls can still name an explicit package.
+
+**Identity and environment:** local tests and an isolated local model runtime.
+No AWS training or deployment was performed.
+
+**Commands and results:** the combined `make check` passed 600 tests at
+96.43% coverage. `make pr-size` measured 15 of 150 source lines. The isolated
+change passed dev and prod synthesis. Tests bind `ListModelPackages` to the
+exact group ARN and check deterministic ordering across multiple input CSVs.
+
+**Interpretation:** stored parameter defaults no longer select the comparison
+model for the managed pipeline path. The training role gets one additional
+read action on its own model package group.
+
+**Decision and next checkpoint:** prepared for local review. Install the
+reviewed Training grants before updating the live pipeline definition.
+
+## [2026-09-05] implement | Deployment resource assurance helpers
+
+**Objective:** prepare reusable checks for deployment retries without changing
+the active approval handler flow in this layer.
+
+**Scope:** deterministic resource names, precise service-error classification,
+resource matching, endpoint-state checks, and direct helper tests.
+
+**Identity and environment:** local tests only. No AWS resource was created.
+
+**Commands and results:** the combined `make check` passed 611 tests at
+96.37% coverage. `make pr-size` measured 113 of 150 source lines.
+
+**Interpretation:** a matching existing resource can be reused. Unrelated
+validation errors and access denials remain failures. Pending deployment
+state is distinct from an already-current endpoint.
+
+**Decision and next checkpoint:** prepared as the first of two retry layers.
+The next layer activates these helpers and adds the scoped Describe grants.
+
+## [2026-09-05] implement | Idempotent approval deployment
+
+**Objective:** prevent repeated approval events from creating repeated
+resources or requesting the same endpoint update again.
+
+**Scope:** approval checks, resource assurance, legacy-resource reuse,
+endpoint-state handling, Serving Describe grants, and regression tests.
+The handler verifies current approval before writes. Matching legacy resources
+can produce a no-op without replacement. Pending deployments have a distinct
+result and log event.
+
+**Identity and environment:** local tests only. No AWS deployment was performed.
+
+**Commands and results:** the combined `make check` passed 634 tests at
+96.17% coverage. `make pr-size` measured 145 of 150 source lines. The isolated
+change passed dev and prod synthesis. Only the serving IAM fingerprint changed
+after review of the scoped Describe actions.
+
+**Interpretation:** an existing resource with the wrong identity is not reused.
+Failed, rollback, and deleting endpoint states are not successful no-ops.
+Access denials remain failures. A final review corrected the in-progress log
+event so it does not claim that the requested model is already current.
+
+**Decision and next checkpoint:** prepared for local review. This protection
+precedes any metadata migration that can trigger approval automation.
+Live retries, cold-start inference, and notification delivery remain unverified.
+
+## [2026-09-05] implement | Share the model-package extraction contract
+
+**Objective:** keep one interpretation of the SageMaker model-container shape
+across drift evaluation and deployment retries.
+
+**Scope:** a pure extractor in `src/common/registry.py`, both callers, and
+regression tests. The extractor accepts one named container or the supported
+primary-container form. Malformed and multiple containers are rejected.
+
+**Identity and environment:** local tests only. This change adds no service
+call or permission.
+
+**Commands and results:** the combined `make check` passed 649 tests at
+96.14% coverage. `make pr-size` measured 29 of 150 source lines.
+Searches for `ModelPackageName`, `Containers`, and `_model_matches` found the
+duplicate parsing. Both handlers now call `extract_model_package_name`.
+
+**Interpretation:** drift preserves explicit validation failures. Deployment
+treats malformed model descriptions as nonmatches. Role and settings checks
+remain local to the deployment handler.
+
+**Decision and next checkpoint:** prepared for local review. Final combined
+security, frontend, documentation, and release-size checks follow.
+
+## [2026-09-05] document | Audit repair release readiness
+
+**Objective:** distinguish prepared source from deployed behavior and give the
+operator a corrected dev release sequence.
+
+**Scope:** README, drift-loop synthesis, capture-design history, a new repair
+readiness decision, and the wiki index. The sequence includes Registry,
+Security, Data, Training, Serving, Ingestion, metadata migration, and Monitoring.
+
+**Identity and environment:** local validation only. No repair was pushed,
+deployed, or applied to AWS permissions. The website remains on hold.
+
+**Commands and results:** the final source check passed 649 tests at 96.14%
+coverage. `make security` passed lock validation, dependency audit, and dev/prod
+synthesis. `make frontend-check` passed five tests and TypeScript checks.
+The frontend production build passed. `make wiki-lint` reports 55 healthy
+pages. `make docs-sync` and `make public-check` passed. The source-history
+Gitleaks scan passed before this final documentation commit.
+
+The repair is prepared as eleven local review branches. Each source change
+is at or below 150 added lines against its actual parent. No size escape was
+used. The original coverage floor remains unchanged.
+
+**Interpretation:** local evidence verifies the repaired source. It does not
+verify cloud permissions, live model behavior, notification delivery, or the
+legacy baseline's provenance. Real outcome labels remain an external input.
+
+**Decision and next checkpoint:** review and merge the local stack in order.
+Resolve the documented identity and baseline-migration gates before a reviewed
+dev rollout. Then run approved training, inference, failure, and recovery checks.
+No deployment or observation-window go decision is recorded here.
 ## [2026-07-12] deploy | AWS security hardening Phase 2A
 
 ### Objective
@@ -7885,3 +8173,313 @@ change to a CIS detection control and takes its own gate. The first
 ### Verification
 
 `make wiki-lint` and `make public-check`.
+
+## [2026-08-21] update | A failed pipeline execution now pages the operator
+
+The drift loop had no failure signal. The repository held three alarms for the
+endpoint and seven for security, and none of them watched the retraining path. A
+drift-triggered execution could fail and leave the endpoint on the old model in
+silence.
+
+`MonitoringStack` now owns `mlops-<env>-ops-pipeline-failed`. See
+[the closed drift loop](pages/concepts/closed-drift-loop.md) for the rule, the
+two scoped grants in `SecurityStack`, and the imported-topic constraint.
+
+This change is the first of three that close the silent-failure gap. The Lambda
+error alarms and the loop-health dashboard follow in their own change sets. No
+observation window is open; the change is not deployed.
+
+## [2026-08-21] update | Every platform handler now has an error alarm
+
+The five handlers ran unattended with no error alarm. A throwing handler was
+visible only as an absence: no curated object, no drift evaluation, no endpoint
+update. See [the closed drift loop](pages/concepts/closed-drift-loop.md) for the
+threshold and the reason for it.
+
+`IngestionStack` and `ServingStack` now take the ops topic, so `build_app` wires
+`security.ops_topic` into four stacks. The dead-letter-queue backlog alarm and
+the loop-health dashboard follow in the next change set. No observation window
+is open; the change is not deployed.
+
+## [2026-08-21] update | The loop is visible, and a stuck message pages
+
+`mlops-<env>-ingest-dlq-backlog` alarms on any message in the ingestion
+dead-letter queue. The `mlops-<env>` dashboard gained a `Drift loop` widget for
+the invocations and errors of both loop handlers. See
+[the closed drift loop](pages/concepts/closed-drift-loop.md).
+
+This change set closes the silent-failure gap opened on 2026-08-21. The three
+change sets together add one event rule, six alarms, and one widget. No
+observation window is open; none of the three is deployed.
+
+---
+
+## [2026-08-28] update | pip upgraded to clear PYSEC-2026-3721
+
+### Objective
+
+Turn CI green. `make audit` failed on every pull request, so the `validate`
+job never reached `synth-all`. A standing red check hides the next real one.
+
+### Scope
+
+`uv.lock` only. One package changed. No source file, no template, and no AWS
+resource was touched.
+
+### Identity and environment
+
+Local workstation only. No AWS profile was used.
+
+### Commands and observed results
+
+1. `uv lock --upgrade-package pip` reported `Updated pip v26.1.2 -> v26.2.1`.
+   The diff touches the `pip` block alone: three lines, the version and the two
+   hashes.
+2. `make install` installed the one package.
+3. `make lock-check` passed, so the lockfile matches `pyproject.toml`.
+4. `make audit` printed `No known vulnerabilities found`. It had reported
+   `pip 26.1.2 PYSEC-2026-3721 26.2`.
+5. The rest of the CI set passed: `lint`, `typecheck`, `test` (411 tests,
+   94.76%), `docs-sync`, `wiki-lint`, `public-check`, and `synth-all` for both
+   environments.
+
+### Interpretation
+
+`pip` is a development dependency of the locked environment, not a runtime
+dependency of any Lambda or pipeline step. The advisory therefore reddened CI
+without exposing the deployed platform. That is still worth clearing: the job
+stops at the first failure, so this one advisory also stopped the cdk-nag gate
+from running on every pull request since it appeared.
+
+Item 5 records what the failing job had been skipping. `synth-all` passed for
+dev and prod, so the gate has been silent, not failing.
+
+### Decision and next checkpoint
+
+The change is the lockfile only. `pyproject.toml` pins no `pip` version, so no
+constraint needed an edit. The next checkpoint is the two open agent-tooling
+pull requests, which were blocked by this same red check.
+
+### Verification
+
+`make lock-check`, `make audit`, `make lint`, `make typecheck`, `make test`,
+`make docs-sync`, `make wiki-lint`, `make public-check`, and `make synth-all`,
+all green.
+
+---
+
+## [2026-09-04] update | The silent-failure change sets merged
+
+### Objective
+
+Close the drift loop's silent-failure gap in `main`. The loop had no failure
+signal. The repository held two endpoint alarms and seven security alarms, and
+none of them watched the retraining path.
+
+### Scope
+
+Three stacked pull requests, merged in order. Each one stayed under the
+150-line cap.
+
+| Pull request | Commit | Adds |
+|---|---|---|
+| #86 | `adf387c` | The `mlops-<env>-ops-pipeline-failed` event rule and its two scoped grants |
+| #87 | `6b9b043` | One `mlops-<env>-<slug>-errors` alarm for each of the five handlers |
+| #88 | `674bd36` | The ingestion dead-letter-queue backlog alarm and the `Drift loop` widget |
+
+No AWS resource changed. The account holds none of these alarms yet.
+
+### Identity and environment
+
+Local workstation only. No AWS profile was used.
+
+### Commands and observed results
+
+1. Each pull request passed `lint`, `typecheck`, `test`, `docs-sync`,
+   `wiki-lint`, `public-check`, `audit`, and `synth-all` for both environments.
+   cdk-nag reported no new finding.
+2. The coverage floor rose from 94.74 to 95.15 across the three merges.
+3. `make pr-size` measured 62, 72, and 61 lines against each own base.
+4. Each merge used the administrator bypass. `main` requires one approving
+   review, and GitHub does not permit an author to approve their own pull
+   request.
+
+### Interpretation
+
+Three facts cost time, and each one repeats on any stack in this repository.
+
+1. **A squash merge makes the next child conflict.** `main` takes the parent as
+   one new commit, and the child carries the parent's own commits. Git reads
+   the shared lines as added on both sides. #87 conflicted in five files and
+   #88 in seven. Every conflict kept the child, which already held the parent
+   through its own history.
+2. **GitHub refuses to retarget a pull request that belongs to a stack.**
+   `gh pr edit --base main` returns "Cannot change the base branch because the
+   pull request is part of a stack". Deleting the merged base branch does not
+   retarget the child. It **closes** the child. Restoring the branch and
+   reopening the pull request recovers it, and the timeline keeps the close.
+3. **A conflict marker in `pyproject.toml` stops every `uv` command.** The
+   completion-gate hook runs `uv`, so an unresolved marker blocks the Bash
+   tool. Resolve that file first.
+
+The `test_pr_base_returns_none_without_a_pull_request` test made a live `gh`
+call and asserted a branch name from the branch that wrote it. It failed on
+every branch that has an open pull request with another base. #86 replaced it
+with a stubbed test that covers each return path.
+
+### Decision and next checkpoint
+
+The gap is closed in code, not in the account. The next checkpoint is a scoped
+dev deploy under the one-phase-per-change-set rule, followed by an observation
+window. `Mlops-<Env>-Security` is in the dependency chain for #86, because the
+event rule needs the topic and key grants. Read the
+`Including dependency stacks:` line before the deploy, and run
+`make verify-deploy SINCE=<YYYY-MM-DD>` after it.
+
+Two alarms cannot be proved by waiting. `mlops-<env>-ops-pipeline-failed` needs
+a failed pipeline execution, and `mlops-<env>-ingest-dlq-backlog` needs a poison
+object. The window MUST provoke both.
+
+### Verification
+
+`scripts/wiki.py index`, then `make wiki-lint` and `make public-check`.
+
+## [2026-09-04] update | The promotion gate stopped reading a stale champion
+
+### Objective
+
+Fix a defect a checkpoint audit found in `main`. The promotion gate compared
+every challenger against a champion AUC that a person recorded at the last
+manual upsert.
+
+### Scope
+
+One pull request, #101, commit `0b3d598`. It merges directly into `main` and
+has no parent.
+
+`get_champion` ran when `build_pipeline` ran, and its result became the
+`ChampionAuc` parameter default. `retrain_handler` called
+`StartPipelineExecution` with no `PipelineParameters`. Nothing in the
+repository re-upserts the pipeline: `pipeline.upsert` runs only from the
+`__main__` CLI, and no workflow, Make target, or stack calls it.
+
+The retrain Lambda now reads the Model Registry when it runs. It sends
+`ChampionAuc` and `ChampionModelPackageArn` as pipeline parameters. The
+build-time lookup stays as the parameter default, because a hand-started
+execution needs it.
+
+`get_champion` moves to `src/common/registry.py`. The Lambda runtime holds no
+`sagemaker` SDK, so the handler cannot import the pipeline definition.
+
+No AWS resource changed. The account does not hold this change.
+
+### Identity and environment
+
+Local workstation only. No AWS profile was used.
+
+### Commands and observed results
+
+1. `make lint`, `make typecheck`, `make docs-sync`, `make public-check`, and
+   `make wiki-lint` each exited 0.
+2. `make test` reported 493 passed. Coverage rose from 95.15 to 95.17, and the
+   floor rose with it.
+3. `make synth-all` synthesized both environments. cdk-nag reported no new
+   finding.
+4. `make pr-size` measured 106 of 150 lines against `origin/main`.
+5. A deliberate mutation removed `PipelineParameters` from the handler. Three
+   tests failed. The tests detect the regression.
+
+### Interpretation
+
+**A parameter default is not a refresh.** The docstring claimed that
+`get_champion` "refreshes each time CI or the retrain trigger upserts the
+pipeline". Neither half was true. A comment that states a mechanism MUST name
+the code that performs it.
+
+**The two Model Registry actions authorize against different resource types.**
+`ListModelPackages` acts on the model package group.
+`DescribeModelPackage` acts on that group's packages. A first draft granted
+both on `model-package/{group}/*`. This log already holds the denial that
+shape produces:
+
+```
+AccessDeniedException ... is not authorized to perform:
+sagemaker:ListModelPackages on resource: model-package/churn-model-group/*
+```
+
+Static analysis got the API surface right and the authorization surface wrong,
+which repeats the Phase 5D finding about `sagemaker:AddTags`.
+
+**A fix MUST NOT reintroduce the defect class it was audited for.** A first
+draft added an acknowledgement whose reason read "Phase 5D removes this
+wildcard". Phase 5D closed on 2026-08-06. The reason now follows the precedent
+that names the phase which scoped the wildcard.
+
+### Next checkpoint
+
+The change is not deployed. It owes a scoped dev deploy and an observation
+window under the one-phase-per-change-set rule. The window MUST cover a
+drift-triggered retrain that resolves a live champion, because no local test
+exercises the new grants against AWS.
+
+### Verification
+
+`uv run --locked python scripts/wiki.py index`, then `make wiki-lint` and
+`make public-check`.
+
+
+## [2026-09-05] query | baseline
+
+Found 22 matching page(s).
+
+## [2026-09-05] query | evaluation
+
+Found 17 matching page(s).
+## [2026-09-05] query | audit repair readiness
+
+Found 35 matching page(s).
+
+
+## [2026-09-05] deploy | Dev repair rollout and live API verification
+
+### Objective and scope
+
+Deploy the authorized MLOps infrastructure from `1072db9`, inspect errors, and
+assess readiness. Website and production remained untouched. See the
+[deployment record](pages/decisions/dev-deployment-check-2026-09-05.md).
+
+### Identity and environment
+
+Dev in `us-east-1`. `${MLOPS_DEPLOYER_USER_NAME}` deployed;
+`${AWS_SECURITY_AUDITOR_USER_NAME}` verified CloudFormation resources.
+`${AWS_ADMIN_USER_NAME}` read application logs and signed the API checks.
+No identity or account execution policy was changed.
+
+### Commands and results
+
+- `make test`: 649 passed, 96.14% coverage, above the 95.17% floor.
+- `make synth-all`: exit zero for dev and prod.
+- Reviewed `make diff-stack` output before scoped deployment.
+- `make deploy-stack ENV=dev` for Security, Training, Serving, and Ingestion:
+  all exited zero. Training also updated Registry; Data was a no-op dependency.
+- `make verify-deploy PREFIX=Mlops-Dev- SINCE=2026-09-05`: 30 resource changes
+  across those five changed stacks. The deployment record lists the resources.
+- SDK pipeline publication without `--start`: failed on `ListModelPackages`
+  with `AccessDeniedException`. The deployed definition remained byte-identical.
+- `make smoke ENV=dev`: six passed with separate inference and discovery
+  identities, after correcting a local jsii cache path.
+- Proxy error-pattern query: no matches in the inspected deployment window.
+- IAM alarm history: `OK` to `ALARM`, followed by a successful SNS action.
+  End-user email receipt and recovery remain unverified.
+
+### Interpretation and next checkpoint
+
+The scoped infrastructure updates succeeded. Full lifecycle release remains
+**no-go**: operator registry permissions block pipeline publication, and absent
+serving-package `baseline_uri` metadata blocks the Monitoring reader rollout.
+Serving retry protection is deployed before any future metadata migration.
+The previous drift reader remains active; its inspected logs show insufficient
+capture volume. No training execution or forced model promotion occurred.
+
+Resolve permissions and baseline provenance, then publish the pipeline and
+exercise training, promotion, drift, retraining, notifications, and recovery.

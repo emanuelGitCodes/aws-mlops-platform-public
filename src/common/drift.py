@@ -14,7 +14,7 @@ import bisect
 import math
 from typing import Any
 
-from src.common.features import FEATURE_COLUMNS, NUMERIC
+from src.common.features import FEATURE_COLUMNS, FEATURE_VOCABULARY, NUMERIC
 
 # Use ten quantile bins for each numeric column.
 NUMERIC_BINS = 10
@@ -38,6 +38,11 @@ SEVERE_COLUMN_PSI = 1.0
 EVENT_SOURCE = "mlops.monitoring"
 EVENT_DETAIL_TYPE = "Drift Evaluation Result"
 DRIFT_STATUS = "DriftDetected"
+
+# Store per-run baselines under this prefix.
+BASELINE_RUN_PREFIX = "monitor/baselines"
+# Registered model metadata uses this key for the baseline URI.
+BASELINE_URI_METADATA_KEY = "baseline_uri"
 
 
 def numeric_value(raw: Any) -> float:
@@ -109,6 +114,67 @@ def build_baseline(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def validate_baseline(baseline: object) -> dict[str, Any]:
+    """Validate the serialized baseline used by every drift scorer."""
+    if not isinstance(baseline, dict):
+        raise ValueError("baseline must be a mapping")
+
+    counts = baseline.get("counts")
+    if not isinstance(counts, dict) or not counts:
+        raise ValueError("counts must be a non-empty mapping")
+
+    record_count = baseline.get("record_count")
+    if not isinstance(record_count, int) or isinstance(record_count, bool) or record_count <= 0:
+        raise ValueError("record_count must be a positive integer")
+    if set(counts) != set(FEATURE_COLUMNS):
+        raise ValueError("counts must contain every feature column exactly")
+
+    edges = baseline.get("edges")
+    if not isinstance(edges, dict) or set(edges) != NUMERIC:
+        raise ValueError("edges must contain every numeric feature column exactly")
+
+    for column in FEATURE_COLUMNS:
+        column_counts = counts[column]
+        if not isinstance(column_counts, dict) or not column_counts:
+            raise ValueError(f"counts[{column!r}] must be a non-empty mapping")
+        if any(
+            not isinstance(bucket, str)
+            or not isinstance(count, int)
+            or isinstance(count, bool)
+            or count <= 0
+            for bucket, count in column_counts.items()
+        ):
+            raise ValueError(f"counts[{column!r}] must use positive integer values")
+        if sum(column_counts.values()) != record_count:
+            raise ValueError(f"counts[{column!r}] total must equal record_count")
+
+        if column in NUMERIC:
+            column_edges = edges[column]
+            if not isinstance(column_edges, list) or not column_edges:
+                raise ValueError(f"edges[{column!r}] must be a non-empty list")
+            edge_values: list[float] = []
+            for edge in column_edges:
+                if not isinstance(edge, (int, float)) or isinstance(edge, bool):
+                    raise ValueError(f"edges[{column!r}] must contain numbers")
+                value = float(edge)
+                if not math.isfinite(value):
+                    raise ValueError(f"edges[{column!r}] must contain finite numbers")
+                edge_values.append(value)
+            if any(
+                edge_values[index - 1] >= edge_values[index] for index in range(1, len(edge_values))
+            ):
+                raise ValueError(f"edges[{column!r}] must be sorted and unique")
+            valid_buckets = {str(index) for index in range(len(column_edges) + 1)}
+            if not set(column_counts).issubset(valid_buckets):
+                raise ValueError(f"counts[{column!r}] contains an invalid bucket")
+        elif column in FEATURE_VOCABULARY and not set(column_counts).issubset(
+            FEATURE_VOCABULARY[column]
+        ):
+            raise ValueError(f"counts[{column!r}] contains an unknown category")
+
+    return baseline
+
+
 def population_stability_index(reference: dict[str, int], current: dict[str, int]) -> float:
     """Return the PSI between two bucket-count distributions."""
     reference_total = sum(reference.values())
@@ -129,23 +195,37 @@ def compare(baseline: dict[str, Any], rows: list[dict[str, Any]]) -> dict[str, A
     The caller decides whether the result is actionable. This function reports
     the measurement and does not apply the sample-size rule.
     """
-    counts = bucket_counts(rows, baseline.get("edges", {}))
-    reference = baseline.get("counts", {})
-    column_psi = {
-        column: round(population_stability_index(reference.get(column, {}), counts[column]), 6)
-        for column in FEATURE_COLUMNS
-    }
+    baseline = validate_baseline(baseline)
+    counts = bucket_counts(rows, baseline["edges"])
+    reference = baseline["counts"]
+    column_psi: dict[str, float | None] = {}
+    unscorable_columns: list[str] = []
+    for column in FEATURE_COLUMNS:
+        reference_counts = reference.get(column, {})
+        if not isinstance(reference_counts, dict):
+            reference_counts = {}
+        current_counts = counts.get(column, {})
+        if reference_counts and not current_counts:
+            unscorable_columns.append(column)
+            column_psi[column] = None
+            continue
+        column_psi[column] = round(population_stability_index(reference_counts, current_counts), 6)
+
     drifted = sorted(
-        column for column, value in column_psi.items() if value >= COLUMN_PSI_THRESHOLD
+        column
+        for column, value in column_psi.items()
+        if value is not None and value >= COLUMN_PSI_THRESHOLD
     )
     fraction = len(drifted) / len(FEATURE_COLUMNS)
-    worst = max(column_psi.values()) if column_psi else 0.0
+    scored_values = [value for value in column_psi.values() if value is not None]
+    worst = max(scored_values) if scored_values else 0.0
     return {
         "record_count": len(rows),
         "column_psi": column_psi,
         "drifted_columns": drifted,
         "drifted_fraction": round(fraction, 6),
         "max_column_psi": round(worst, 6),
+        "unscorable_columns": unscorable_columns,
         # Declare drift from a broad shift or one severe column shift.
         "drifted": fraction >= DRIFTED_COLUMN_FRACTION or worst >= SEVERE_COLUMN_PSI,
     }

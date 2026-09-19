@@ -82,7 +82,9 @@ def test_gate_compares_challenger_auc_against_the_champion(definition):
     left = condition["LeftValue"]["Std:JsonGet"]
     assert left["Path"] == "binary_classification_metrics.auc.value"
     assert left["PropertyFile"]["Get"].startswith("Steps.Evaluate")
-    assert condition["RightValue"] == {"Get": "Parameters.ChampionAuc"}
+    right = condition["RightValue"]["Std:JsonGet"]
+    assert right["Path"] == "current_champion_auc"
+    assert right["PropertyFile"]["Get"].startswith("Steps.Evaluate")
 
 
 def test_registration_only_happens_behind_the_gate(definition):
@@ -99,15 +101,17 @@ def test_registration_only_happens_behind_the_gate(definition):
 def test_evaluate_receives_the_champion_to_compare_against(definition):
     arguments = _step(definition, "Evaluate")["Arguments"]["AppSpecification"]["ContainerArguments"]
     assert "--champion-model-package-arn" in arguments
+    assert "--model-package-group" in arguments
+    assert arguments[arguments.index("--model-package-group") + 1] == GROUP
     assert "--champion-test-auc" in arguments
+    assert "--artifacts-bucket" in arguments
+    assert "--region" in arguments
     assert "--challenger-model-artifact" in arguments
 
 
-def test_preprocess_and_train_are_cached_but_evaluate_is_not(definition):
-    """Cache preprocessing and training. Always run evaluation."""
-    for name in ("Preprocess", "Train"):
-        assert _step(definition, name)["CacheConfig"]["Enabled"] is True
-    assert "CacheConfig" not in _step(definition, "Evaluate")
+def test_mutable_data_steps_do_not_use_cache(definition):
+    for name in ("Preprocess", "Train", "Evaluate"):
+        assert "CacheConfig" not in _step(definition, name)
 
 
 def test_model_artifacts_land_where_the_model_role_is_allowed_to_read(definition):
@@ -130,18 +134,22 @@ def test_evaluation_reports_land_where_the_pipeline_role_is_allowed_to_write(def
 
 
 def test_the_baseline_lands_where_the_drift_lambda_reads_it(definition):
-    """Write the baseline under the drift Lambda read key."""
-    from infra.stacks.shared import BASELINE_KEY, MONITOR_OUTPUT_PREFIX
-    from src.pipeline.pipeline import BASELINE_DESTINATION_PREFIX
-
-    assert BASELINE_DESTINATION_PREFIX.startswith(f"{MONITOR_OUTPUT_PREFIX}/")
-    assert BASELINE_KEY == f"{BASELINE_DESTINATION_PREFIX}/baseline.json"
+    """Write an execution-scoped baseline and register its URI metadata."""
+    from src.common.drift import BASELINE_RUN_PREFIX, BASELINE_URI_METADATA_KEY
 
     outputs = _step(definition, "Preprocess")["Arguments"]["ProcessingOutputConfig"]["Outputs"]
     baseline = next(o for o in outputs if o["OutputName"] == "baseline")
-    # The other outputs are execution-scoped. This one must not be: the drift
-    # Lambda reads a fixed key and cannot discover an execution id.
-    assert baseline["S3Output"]["S3Uri"].endswith(f"/{BASELINE_DESTINATION_PREFIX}")
+    destination = json.dumps(baseline["S3Output"]["S3Uri"])
+    assert BASELINE_RUN_PREFIX in destination
+    assert "Execution.PipelineExecutionId" in destination
+
+    register = _step(definition, "BeatsChampion")["Arguments"]["IfSteps"][0]
+    metadata = register["Arguments"]["CustomerMetadataProperties"]
+    assert BASELINE_URI_METADATA_KEY in metadata
+    metadata_uri = json.dumps(metadata[BASELINE_URI_METADATA_KEY])
+    assert BASELINE_RUN_PREFIX in metadata_uri
+    assert "Execution.PipelineExecutionId" in metadata_uri
+    assert "baseline.json" in metadata_uri
 
 
 def test_training_hyperparameters_reach_the_estimator(definition):
@@ -167,3 +175,31 @@ def test_existing_champion_becomes_the_bar_to_beat():
     parameters = {p["Name"]: p for p in definition["Parameters"]}
     assert parameters["ChampionAuc"]["DefaultValue"] == pytest.approx(0.8398)
     assert parameters["ChampionModelPackageArn"]["DefaultValue"] == CHAMPION_ARN
+
+
+def test_explicit_start_parameters_resolve_the_current_champion():
+    from src.pipeline.pipeline import _fresh_champion_parameters
+
+    with mock.patch(
+        "src.pipeline.pipeline.get_champion", return_value=(CHAMPION_ARN, 0.91)
+    ) as lookup:
+        parameters = _fresh_champion_parameters(GROUP, "us-east-1")
+
+    assert parameters == {"ChampionAuc": 0.91, "ChampionModelPackageArn": CHAMPION_ARN}
+    lookup.assert_called_once_with(GROUP, "us-east-1")
+
+
+def test_explicit_start_passes_fresh_champion_parameters():
+    from src.pipeline.pipeline import _start_pipeline
+
+    pipeline = mock.Mock()
+    with mock.patch(
+        "src.pipeline.pipeline._fresh_champion_parameters",
+        return_value={"ChampionAuc": 0.91, "ChampionModelPackageArn": CHAMPION_ARN},
+    ) as fresh:
+        _start_pipeline(pipeline, GROUP, "us-east-1")
+
+    fresh.assert_called_once_with(GROUP, "us-east-1")
+    pipeline.start.assert_called_once_with(
+        parameters={"ChampionAuc": 0.91, "ChampionModelPackageArn": CHAMPION_ARN}
+    )

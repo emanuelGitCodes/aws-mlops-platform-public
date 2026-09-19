@@ -2,6 +2,7 @@
 
 from aws_cdk.assertions import Match
 
+from infra.stacks.serving_stack import ENDPOINT_EVENT_DETAIL_TYPE, ENDPOINT_FAILURE_STATES
 from infra.stacks.shared import MODEL_ARTIFACT_PREFIX
 from tests.unit.conftest import CONFIG
 
@@ -146,7 +147,9 @@ def test_the_deploy_role_names_every_resource_it_touches(stacks):
         "logs:CreateLogStream",
         "logs:PutLogEvents",
         "sagemaker:CreateModel",
+        "sagemaker:DescribeModel",
         "sagemaker:CreateEndpointConfig",
+        "sagemaker:DescribeEndpointConfig",
         "sagemaker:CreateEndpoint",
         "sagemaker:UpdateEndpoint",
         "sagemaker:DescribeEndpoint",
@@ -222,3 +225,47 @@ def test_the_proxy_may_write_capture_and_read_nothing(stacks):
     flat = [a for entry in actions for a in ([entry] if isinstance(entry, str) else entry)]
     assert "s3:PutObject" in flat
     assert not [a for a in flat if a.startswith("s3:Get") or a.startswith("s3:Delete")]
+
+
+def test_the_deploy_and_proxy_handlers_have_error_alarms(stacks):
+    """A deploy handler that throws leaves the endpoint on the old model while
+    the registry shows the new package as approved."""
+    alarms = {
+        resource["Properties"]["AlarmName"]: resource["Properties"]
+        for resource in stacks["serving"].to_json()["Resources"].values()
+        if resource["Type"] == "AWS::CloudWatch::Alarm"
+    }
+    env = CONFIG["env_name"]
+    assert set(alarms) == {f"mlops-{env}-deploy-errors", f"mlops-{env}-proxy-errors"}
+    for alarm in alarms.values():
+        assert alarm["Namespace"] == "AWS/Lambda"
+        assert alarm["MetricName"] == "Errors"
+        assert "OpsAlertsTopic" in str(alarm["AlarmActions"])
+
+
+def test_endpoint_failure_events_are_scoped_and_page_the_ops_topic(stacks):
+    resources = stacks["serving"].to_json()["Resources"]
+    rule = next(
+        resource["Properties"]
+        for resource in resources.values()
+        if resource["Type"] == "AWS::Events::Rule"
+        and resource["Properties"].get("Name") == f"mlops-{CONFIG['env_name']}-ops-endpoint-failed"
+    )
+    pattern = rule["EventPattern"]
+    assert pattern["source"] == ["aws.sagemaker"]
+    assert pattern["detail-type"] == [ENDPOINT_EVENT_DETAIL_TYPE]
+    assert pattern["detail"] == {
+        "EndpointName": [CONFIG["endpoint_name"]],
+        "EndpointStatus": ENDPOINT_FAILURE_STATES,
+    }
+    resource_arn = str(pattern["resources"])
+    assert "endpoint/" in resource_arn
+    assert CONFIG["endpoint_name"] in resource_arn
+
+    (target,) = rule["Targets"]
+    assert "OpsAlertsTopic" in str(target["Arn"])
+    assert "SecurityAlertsTopic" not in str(target["Arn"])
+    transformer = target["InputTransformer"]
+    assert transformer["InputPathsMap"] == {"detail-EndpointStatus": "$.detail.EndpointStatus"}
+    assert "EndpointStatus" in transformer["InputTemplate"]
+    assert "FailureReason" not in transformer["InputTemplate"]

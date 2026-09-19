@@ -71,6 +71,84 @@ def test_bucket_counts_ignores_a_column_the_row_omits():
     assert counts["gender"] == {}
 
 
+def test_compare_marks_a_missing_window_column_as_unscorable():
+    baseline = drift.build_baseline(varied_records(500, seed=1))
+    stripped_rows = [
+        {column: value for column, value in record.items() if column != "Contract"}
+        for record in varied_records(200, seed=1)
+    ]
+    result = drift.compare(baseline, stripped_rows)
+
+    assert result["unscorable_columns"] == ["Contract"]
+    assert result["column_psi"]["Contract"] is None
+    assert result["drifted"] is False
+
+
+def test_compare_rejects_non_mapping_baseline_counts():
+    baseline = drift.build_baseline(varied_records(50, seed=2))
+    baseline["counts"]["Contract"] = 5
+
+    with pytest.raises(ValueError, match=r"counts.*Contract"):
+        drift.compare(baseline, varied_records(25, seed=2))
+
+
+def test_validate_baseline_requires_every_feature_distribution():
+    baseline = drift.build_baseline(varied_records(50, seed=2))
+    del baseline["counts"]["Contract"]
+
+    with pytest.raises(ValueError, match="every feature column"):
+        drift.validate_baseline(baseline)
+
+
+@pytest.mark.parametrize("invalid_count", [0, -1, 1.0, True])
+def test_validate_baseline_rejects_invalid_bucket_counts(invalid_count):
+    baseline = drift.build_baseline(varied_records(50, seed=2))
+    column = "Contract"
+    bucket = next(iter(baseline["counts"][column]))
+    baseline["counts"][column][bucket] = invalid_count
+
+    with pytest.raises(ValueError, match=r"counts\['Contract'\]"):
+        drift.validate_baseline(baseline)
+
+
+def test_validate_baseline_rejects_inconsistent_distribution_totals():
+    baseline = drift.build_baseline(varied_records(50, seed=2))
+    baseline["counts"]["Contract"]["One year"] += 1
+
+    with pytest.raises(ValueError, match="total must equal record_count"):
+        drift.validate_baseline(baseline)
+
+
+def test_validate_baseline_rejects_invalid_numeric_edges_and_buckets():
+    baseline = drift.build_baseline(varied_records(50, seed=2))
+    baseline["edges"]["tenure"] = [1.0, 1.0]
+
+    with pytest.raises(ValueError, match=r"edges\['tenure'\]"):
+        drift.validate_baseline(baseline)
+
+    baseline = drift.build_baseline(varied_records(50, seed=2))
+    baseline["counts"]["tenure"]["99"] = 1
+    source_bucket = next(
+        bucket for bucket, count in baseline["counts"]["tenure"].items() if count > 1
+    )
+    baseline["counts"]["tenure"][source_bucket] -= 1
+
+    with pytest.raises(ValueError, match=r"counts\['tenure'\].*bucket"):
+        drift.validate_baseline(baseline)
+
+
+def test_validate_baseline_rejects_unknown_categorical_buckets():
+    baseline = drift.build_baseline(varied_records(50, seed=2))
+    baseline["counts"]["Contract"]["Unknown"] = 1
+    source_bucket = next(
+        bucket for bucket, count in baseline["counts"]["Contract"].items() if count > 1
+    )
+    baseline["counts"]["Contract"][source_bucket] -= 1
+
+    with pytest.raises(ValueError, match=r"counts\['Contract'\].*category"):
+        drift.validate_baseline(baseline)
+
+
 def test_build_baseline_stores_edges_for_every_numeric_column():
     baseline = drift.build_baseline(spread(50, "tenure", [1, 12, 24, 48, 60]))
     assert baseline["record_count"] == 50
@@ -181,6 +259,8 @@ def test_compare_survives_an_empty_window():
     result = drift.compare(drift.build_baseline(rows(10)), [])
     assert result["record_count"] == 0
     assert result["drifted"] is False
+    assert set(result["unscorable_columns"]) == set(FEATURE_COLUMNS)
+    assert all(result["column_psi"][column] is None for column in FEATURE_COLUMNS)
 
 
 def test_distinct_record_count_sees_through_repetition():

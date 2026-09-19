@@ -59,6 +59,7 @@ def build_app(app: cdk.App, config: PlatformConfig, prefix: str) -> dict[str, cd
         f"{prefix}-Ingestion",
         raw_bucket=data.raw_bucket,
         curated_bucket=data.curated_bucket,
+        ops_topic=security.ops_topic,
         config=config,
     )
     registry = RegistryStack(app, f"{prefix}-Registry", config=config)
@@ -69,13 +70,16 @@ def build_app(app: cdk.App, config: PlatformConfig, prefix: str) -> dict[str, cd
         artifacts_bucket=data.artifacts_bucket,
         config=config,
     )
+    training.add_stack_dependency(registry)
     serving = ServingStack(
         app,
         f"{prefix}-Serving",
         artifacts_bucket=data.artifacts_bucket,
         package_group_name=registry.package_group_name,
+        ops_topic=security.ops_topic,
         config=config,
     )
+    serving.add_stack_dependency(registry)
     cicd = CicdStack(
         app,
         f"{prefix}-Cicd",
@@ -88,8 +92,10 @@ def build_app(app: cdk.App, config: PlatformConfig, prefix: str) -> dict[str, cd
         f"{prefix}-Monitoring",
         ops_topic=security.ops_topic,
         artifacts_bucket=data.artifacts_bucket,
+        package_group_name=registry.package_group_name,
         config=config,
     )
+    monitoring.add_stack_dependency(registry)
 
     stacks = {
         "data": data,

@@ -1,14 +1,16 @@
 """Define the preprocess, train, evaluate, gate, and register pipeline.
 
-`get_champion` reads the champion AUC from the Model Registry and sets it as
-the `ChampionAuc` parameter default. It refreshes each time CI or the retrain
-trigger upserts the pipeline. A challenger registers only when its test AUC
-beats the champion.
+The evaluation step resolves the supplied champion package and scores it on the
+same held-out rows as the challenger. The `ChampionAuc` parameter remains for
+execution compatibility. A challenger registers only when its test AUC beats
+the current champion.
 """
 
-import argparse
+from __future__ import annotations
 
-import boto3
+import argparse
+from typing import Any
+
 import sagemaker
 from sagemaker.inputs import TrainingInput
 from sagemaker.model import Model
@@ -25,21 +27,15 @@ from sagemaker.workflow.parameters import ParameterFloat, ParameterString
 from sagemaker.workflow.pipeline import Pipeline
 from sagemaker.workflow.pipeline_context import PipelineSession
 from sagemaker.workflow.properties import PropertyFile
-from sagemaker.workflow.steps import CacheConfig, ProcessingStep, TrainingStep
+from sagemaker.workflow.steps import ProcessingStep, TrainingStep
 
-from src.common.features import BASELINE_CHAMPION_AUC, NO_CHAMPION_ARN
+from src.common.drift import BASELINE_RUN_PREFIX, BASELINE_URI_METADATA_KEY
+from src.common.registry import get_champion
 
 # Configure processing, training, and inference instance types separately.
 PROCESSING_INSTANCE_TYPE = "ml.m5.large"
 TRAINING_INSTANCE_TYPE = "ml.m5.large"
 INFERENCE_INSTANCE_TYPES = ["ml.m5.large"]
-
-# The drift Lambda reads the baseline from this fixed prefix.
-# `infra/stacks/shared.py` repeats it for IAM and the Lambda environment.
-# `tests/unit/test_pipeline.py` compares both values.
-#
-# Each preprocessing run replaces the baseline object.
-BASELINE_DESTINATION_PREFIX = "monitor/baseline"
 
 # SageMaker represents each hyperparameter as a string.
 # The SDK type also permits `PipelineVariable` values.
@@ -53,25 +49,6 @@ TRAINING_HYPERPARAMETERS: dict[str, str | PipelineVariable] = {
 }
 
 
-def get_champion(model_package_group: str, region: str) -> tuple[str, float]:
-    """Return the latest approved package ARN and its AUC. If the group holds
-    no approved package, return the 0.5 baseline."""
-    sm = boto3.client("sagemaker", region_name=region)
-    packages = sm.list_model_packages(
-        ModelPackageGroupName=model_package_group,
-        ModelApprovalStatus="Approved",
-        SortBy="CreationTime",
-        SortOrder="Descending",
-        MaxResults=1,
-    )["ModelPackageSummaryList"]
-    if not packages:
-        return NO_CHAMPION_ARN, BASELINE_CHAMPION_AUC
-    arn = packages[0]["ModelPackageArn"]
-    description = sm.describe_model_package(ModelPackageName=arn)
-    metadata = description.get("CustomerMetadataProperties", {})
-    return arn, float(metadata.get("test_auc", BASELINE_CHAMPION_AUC))
-
-
 def build_pipeline(
     pipeline_name: str,
     role_arn: str,
@@ -82,7 +59,6 @@ def build_pipeline(
     region: str = "us-east-1",
 ) -> Pipeline:
     session = PipelineSession(default_bucket=artifacts_bucket)
-    cache = CacheConfig(enable_caching=True, expire_after="P30D")
 
     input_data = ParameterString(name="InputDataUri", default_value=f"s3://{curated_bucket}/telco/")
     champion_model_arn, champion_test_auc = get_champion(model_package_group, region)
@@ -90,6 +66,15 @@ def build_pipeline(
     champion_model = ParameterString(
         name="ChampionModelPackageArn", default_value=champion_model_arn
     )
+    baseline_destination = Join(
+        on="/",
+        values=[
+            f"s3://{artifacts_bucket}",
+            BASELINE_RUN_PREFIX,
+            ExecutionVariables.PIPELINE_EXECUTION_ID,
+        ],
+    )
+    baseline_uri = Join(on="/", values=[baseline_destination, "baseline.json"])
 
     # `FrameworkProcessor` bundles `src` with the preprocessing entrypoint.
     preprocess_processor = FrameworkProcessor(
@@ -113,15 +98,13 @@ def build_pipeline(
             ProcessingOutput(
                 output_name="baseline",
                 source="/opt/ml/processing/baseline",
-                destination=f"s3://{artifacts_bucket}/{BASELINE_DESTINATION_PREFIX}",
+                destination=baseline_destination,
             ),
         ],
     )
     preprocess = ProcessingStep(
         name="Preprocess",
         step_args=preprocess_args,
-        # Apply cache configuration to the pipeline step.
-        cache_config=cache,
     )
 
     image_uri = sagemaker.image_uris.retrieve("xgboost", region, version="1.7-1")
@@ -147,7 +130,6 @@ def build_pipeline(
                 content_type="text/csv",
             ),
         },
-        cache_config=cache,
     )
 
     evaluation_report = PropertyFile(
@@ -195,8 +177,14 @@ def build_pipeline(
         arguments=[
             "--champion-model-package-arn",
             champion_model,
+            "--model-package-group",
+            model_package_group,
             "--champion-test-auc",
             champion_auc.to_string(),
+            "--artifacts-bucket",
+            artifacts_bucket,
+            "--region",
+            region,
             "--challenger-model-artifact",
             train.properties.ModelArtifacts.S3ModelArtifacts,
         ],
@@ -211,6 +199,11 @@ def build_pipeline(
         step_name=evaluate.name,
         property_file=evaluation_report,
         json_path="binary_classification_metrics.auc.value",
+    )
+    current_champion_auc = JsonGet(
+        step_name=evaluate.name,
+        property_file=evaluation_report,
+        json_path="current_champion_auc",
     )
 
     model = Model(
@@ -241,7 +234,10 @@ def build_pipeline(
                     content_type="application/json",
                 )
             ),
-            customer_metadata_properties={"test_auc": challenger_auc.to_string()},
+            customer_metadata_properties={
+                "test_auc": challenger_auc.to_string(),
+                BASELINE_URI_METADATA_KEY: baseline_uri,
+            },
         ),
     )
 
@@ -252,7 +248,7 @@ def build_pipeline(
             # SDK `left` hint omits it. Remove the ignore if the SDK adds it.
             ConditionGreaterThan(
                 left=challenger_auc,  # type: ignore[arg-type]
-                right=champion_auc,
+                right=current_champion_auc,  # type: ignore[arg-type]
             )
         ],
         if_steps=[register],
@@ -265,6 +261,17 @@ def build_pipeline(
         steps=[preprocess, train, evaluate, gate],
         sagemaker_session=session,
     )
+
+
+def _fresh_champion_parameters(model_package_group: str, region: str) -> dict[str, float | str]:
+    """Return current registry values for an explicit pipeline start."""
+    champion_arn, champion_auc = get_champion(model_package_group, region)
+    return {"ChampionAuc": champion_auc, "ChampionModelPackageArn": champion_arn}
+
+
+def _start_pipeline(pipeline: Pipeline, model_package_group: str, region: str) -> Any:
+    """Start a pipeline with registry values read after the upsert."""
+    return pipeline.start(parameters=_fresh_champion_parameters(model_package_group, region))
 
 
 if __name__ == "__main__":
@@ -291,5 +298,5 @@ if __name__ == "__main__":
     pipeline.upsert(role_arn=args.role_arn)
     print(f"upserted pipeline {args.pipeline_name}")
     if args.start:
-        execution = pipeline.start()
+        execution = _start_pipeline(pipeline, args.model_package_group, args.region)
         print(f"started execution {execution.arn}")

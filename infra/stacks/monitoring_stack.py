@@ -13,6 +13,7 @@ from aws_cdk import aws_cloudwatch_actions as cw_actions
 from aws_cdk import aws_events as events
 from aws_cdk import aws_events_targets as targets
 from aws_cdk import aws_iam as iam
+from aws_cdk import aws_logs as logs
 from aws_cdk import aws_s3 as s3
 from aws_cdk import aws_sns as sns
 from constructs import Construct
@@ -21,9 +22,11 @@ from infra.stacks.shared import (
     BASELINE_KEY,
     CAPTURE_PREFIX,
     PlatformConfig,
+    handler_error_alarm,
     lambda_event_rule,
     platform_lambda,
 )
+from src.common.drift import BASELINE_RUN_PREFIX
 
 # Keep these literals synchronized with `src/common/drift.py`.
 # Importing the handler evaluates its environment lookups during synthesis.
@@ -31,6 +34,12 @@ from infra.stacks.shared import (
 DRIFT_EVENT_SOURCE = "mlops.monitoring"
 DRIFT_EVENT_DETAIL_TYPE = "Drift Evaluation Result"
 DRIFT_STATUS = "DriftDetected"
+
+# SageMaker publishes this event for each pipeline execution state change.
+PIPELINE_EVENT_DETAIL_TYPE = "SageMaker Model Building Pipeline Execution Status Change"
+
+# These execution states end a run without a registered model.
+PIPELINE_FAILURE_STATES = ["Failed", "Stopped"]
 
 
 class MonitoringStack(Stack):
@@ -41,6 +50,7 @@ class MonitoringStack(Stack):
         *,
         ops_topic: sns.ITopic,
         artifacts_bucket: s3.IBucket,
+        package_group_name: str,
         config: PlatformConfig,
         **kwargs: Any,
     ) -> None:
@@ -64,6 +74,7 @@ class MonitoringStack(Stack):
                 "ARTIFACTS_BUCKET": artifacts_bucket.bucket_name,
                 "BASELINE_KEY": BASELINE_KEY,
                 "CAPTURE_PREFIX": CAPTURE_PREFIX,
+                "ENDPOINT_NAME": endpoint_name,
             },
         )
         # Grant read-only access to the baseline and capture window.
@@ -72,8 +83,48 @@ class MonitoringStack(Stack):
                 actions=["s3:GetObject"],
                 resources=[
                     artifacts_bucket.arn_for_objects(BASELINE_KEY),
+                    artifacts_bucket.arn_for_objects(f"{BASELINE_RUN_PREFIX}/*"),
                     artifacts_bucket.arn_for_objects(f"{CAPTURE_PREFIX}/*"),
                 ],
+            )
+        )
+
+        endpoint_arn = self.format_arn(
+            service="sagemaker",
+            resource="endpoint",
+            resource_name=endpoint_name,
+        )
+        endpoint_config_arn = self.format_arn(
+            service="sagemaker",
+            resource="endpoint-config",
+            resource_name=f"{endpoint_name}-config-*",
+        )
+        model_arn = self.format_arn(
+            service="sagemaker",
+            resource="model",
+            resource_name=f"{endpoint_name}-model-*",
+        )
+        model_package_arn = self.format_arn(
+            service="sagemaker",
+            resource="model-package",
+            resource_name=f"{package_group_name}/*",
+        )
+        drift_fn.add_to_role_policy(
+            iam.PolicyStatement(actions=["sagemaker:DescribeEndpoint"], resources=[endpoint_arn])
+        )
+        drift_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["sagemaker:DescribeEndpointConfig"],
+                resources=[endpoint_config_arn],
+            )
+        )
+        drift_fn.add_to_role_policy(
+            iam.PolicyStatement(actions=["sagemaker:DescribeModel"], resources=[model_arn])
+        )
+        drift_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["sagemaker:DescribeModelPackage"],
+                resources=[model_package_arn],
             )
         )
         # `ListBucket` uses the bucket ARN. The prefix condition limits the listing.
@@ -104,13 +155,18 @@ class MonitoringStack(Stack):
         )
 
         # A violation starts one training pipeline execution.
+        retrain_no_progress_limit = str(config["monitor"]["retrain_no_progress_limit"])
         retrain_fn = platform_lambda(
             self,
             "RetrainTriggerFn",
             config=config,
             handler="src.monitoring.retrain_handler.handler",
             timeout=Duration.minutes(1),
-            environment={"PIPELINE_NAME": pipeline_name},
+            environment={
+                "MODEL_PACKAGE_GROUP": package_group_name,
+                "PIPELINE_NAME": pipeline_name,
+                "RETRAIN_NO_PROGRESS_LIMIT": retrain_no_progress_limit,
+            },
         )
         # The cooldown reads `ListPipelineExecutions` before it starts a run.
         # A persistent shift emits one violation for each scheduled evaluation.
@@ -129,6 +185,31 @@ class MonitoringStack(Stack):
                 ],
             )
         )
+        # The retrain function resolves the champion from this model package group.
+        retrain_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["sagemaker:ListModelPackages"],
+                resources=[
+                    self.format_arn(
+                        service="sagemaker",
+                        resource="model-package-group",
+                        resource_name=package_group_name,
+                    )
+                ],
+            )
+        )
+        retrain_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["sagemaker:DescribeModelPackage"],
+                resources=[
+                    self.format_arn(
+                        service="sagemaker",
+                        resource="model-package",
+                        resource_name=f"{package_group_name}/*",
+                    )
+                ],
+            )
+        )
 
         lambda_event_rule(
             self,
@@ -138,6 +219,78 @@ class MonitoringStack(Stack):
             detail={"status": [DRIFT_STATUS]},
             handler=retrain_fn,
         )
+
+        # A retrain that fails leaves the endpoint on the old model.
+        # SageMaker publishes no metric for a failed execution, so this rule is
+        # the only signal. The rule name must keep the `-ops-` part.
+        # `SecurityStack` scopes the topic and key grants to that prefix.
+        events.Rule(
+            self,
+            "PipelineFailureRule",
+            rule_name=f"mlops-{config['env_name']}-ops-pipeline-failed",
+            event_pattern=events.EventPattern(
+                source=["aws.sagemaker"],
+                detail_type=[PIPELINE_EVENT_DETAIL_TYPE],
+                detail={
+                    "currentPipelineExecutionStatus": PIPELINE_FAILURE_STATES,
+                    # Both environments publish to the same default bus.
+                    "pipelineArn": events.Match.suffix(f"pipeline/{pipeline_name}"),
+                },
+            ),
+            targets=[
+                targets.SnsTopic(
+                    # An imported topic has an immutable resource policy, so the
+                    # target adds no unconditioned publish grant of its own.
+                    # `SecurityStack` owns the grant, scoped to this rule prefix.
+                    sns.Topic.from_topic_arn(self, "OpsTopicRef", ops_topic.topic_arn),
+                    message=events.RuleTargetInput.from_text(
+                        f"The {pipeline_name} pipeline execution ended as "
+                        + events.EventField.from_path("$.detail.currentPipelineExecutionStatus")
+                        + ": "
+                        + events.EventField.from_path("$.detail.pipelineExecutionArn")
+                    ),
+                )
+            ],
+        )
+
+        # A handler that throws stops the loop and reports nothing else.
+        handler_error_alarm(
+            self, "DriftErrors", handler=drift_fn, slug="drift", config=config, topic=ops_topic
+        )
+        handler_error_alarm(
+            self,
+            "RetrainErrors",
+            handler=retrain_fn,
+            slug="retrain",
+            config=config,
+            topic=ops_topic,
+        )
+
+        # A stalled retrain loop logs one structured event before it returns.
+        # The metric filter reads only that event name from this function's log group.
+        stalled_filter = logs.MetricFilter(
+            self,
+            "RetrainLoopStalledFilter",
+            default_value=0,
+            filter_pattern=logs.FilterPattern.string_value("$.event", "=", "retrain_loop_stalled"),
+            log_group=retrain_fn.log_group,
+            metric_name="RetrainLoopStalled",
+            metric_namespace=f"MLOps/Monitoring/{config['env_name']}",
+            metric_value="1",
+        )
+        stalled_alarm = cw.Alarm(
+            self,
+            "RetrainLoopStalledAlarm",
+            alarm_name=f"mlops-{config['env_name']}-retrain-loop-stalled",
+            metric=stalled_filter.metric(
+                period=Duration.minutes(15),
+                statistic="Sum",
+            ),
+            threshold=1,
+            evaluation_periods=1,
+            treat_missing_data=cw.TreatMissingData.NOT_BREACHING,
+        )
+        stalled_alarm.add_alarm_action(cw_actions.SnsAction(ops_topic))
 
         dims = {"EndpointName": endpoint_name, "VariantName": "AllTraffic"}
 
@@ -168,6 +321,22 @@ class MonitoringStack(Stack):
                 left=[
                     _sm_metric("Invocation4XXErrors", "Sum"),
                     _sm_metric("Invocation5XXErrors", "Sum"),
+                ],
+            ),
+        )
+
+        # The loop runs on a schedule and reports through logs alone. These
+        # widgets show whether it ran and whether it started a retrain.
+        dashboard.add_widgets(
+            cw.GraphWidget(
+                title="Drift loop",
+                left=[
+                    drift_fn.metric_invocations(statistic="Sum", label="Drift evaluations"),
+                    retrain_fn.metric_invocations(statistic="Sum", label="Retrain triggers"),
+                ],
+                right=[
+                    drift_fn.metric_errors(statistic="Sum", label="Drift errors"),
+                    retrain_fn.metric_errors(statistic="Sum", label="Retrain errors"),
                 ],
             ),
         )

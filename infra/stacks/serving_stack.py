@@ -4,8 +4,11 @@ from typing import Any
 
 from aws_cdk import ArnFormat, CfnOutput, Duration, Stack
 from aws_cdk import aws_apigateway as apigw
+from aws_cdk import aws_events as events
+from aws_cdk import aws_events_targets as targets
 from aws_cdk import aws_iam as iam
 from aws_cdk import aws_s3 as s3
+from aws_cdk import aws_sns as sns
 from constructs import Construct
 
 from infra.stacks.lambda_code import src_code
@@ -13,10 +16,15 @@ from infra.stacks.shared import (
     CAPTURE_PREFIX,
     MODEL_ARTIFACT_PREFIX,
     PlatformConfig,
+    handler_error_alarm,
     lambda_event_rule,
     platform_lambda,
     sagemaker_execution_role,
 )
+
+# SageMaker sends endpoint state events with uppercase underscore values.
+ENDPOINT_EVENT_DETAIL_TYPE = "SageMaker Endpoint State Change"
+ENDPOINT_FAILURE_STATES = ["FAILED", "ROLLING_BACK", "UPDATE_ROLLBACK_FAILED"]
 
 
 class ServingStack(Stack):
@@ -27,6 +35,7 @@ class ServingStack(Stack):
         *,
         artifacts_bucket: s3.IBucket,
         package_group_name: str,
+        ops_topic: sns.ITopic,
         config: PlatformConfig,
         **kwargs: Any,
     ) -> None:
@@ -103,7 +112,7 @@ class ServingStack(Stack):
             },
         )
         # Scope each action to resources named by `deploy_handler`.
-        # Generated model and endpoint-config names end with the epoch second.
+        # Generated model and endpoint-config names end with a package hash.
         #
         # The handler does not call `Delete*` or `List*` actions.
         # The `aws/lambda` key policy authorizes the cold-start decrypt.
@@ -114,7 +123,7 @@ class ServingStack(Stack):
         )
         deploy_fn.add_to_role_policy(
             iam.PolicyStatement(
-                actions=["sagemaker:CreateModel"],
+                actions=["sagemaker:CreateModel", "sagemaker:DescribeModel"],
                 resources=[
                     self.format_arn(
                         service="sagemaker",
@@ -126,7 +135,7 @@ class ServingStack(Stack):
         )
         deploy_fn.add_to_role_policy(
             iam.PolicyStatement(
-                actions=["sagemaker:CreateEndpointConfig"],
+                actions=["sagemaker:CreateEndpointConfig", "sagemaker:DescribeEndpointConfig"],
                 resources=[endpoint_config_arn],
             )
         )
@@ -170,6 +179,31 @@ class ServingStack(Stack):
                 "ModelApprovalStatus": ["Approved"],
             },
             handler=deploy_fn,
+        )
+
+        # Notify operators when the configured endpoint enters a failed state.
+        events.Rule(
+            self,
+            "EndpointFailureRule",
+            rule_name=f"mlops-{config['env_name']}-ops-endpoint-failed",
+            event_pattern=events.EventPattern(
+                source=["aws.sagemaker"],
+                detail_type=[ENDPOINT_EVENT_DETAIL_TYPE],
+                resources=[endpoint_arn],
+                detail={
+                    "EndpointName": [endpoint_name],
+                    "EndpointStatus": ENDPOINT_FAILURE_STATES,
+                },
+            ),
+            targets=[
+                targets.SnsTopic(
+                    sns.Topic.from_topic_arn(self, "OpsTopicRef", ops_topic.topic_arn),
+                    message=events.RuleTargetInput.from_text(
+                        f"The {endpoint_name} SageMaker endpoint entered state "
+                        + events.EventField.from_path("$.detail.EndpointStatus")
+                    ),
+                )
+            ],
         )
 
         # API Gateway sends signed prediction requests to the proxy Lambda.
@@ -233,4 +267,12 @@ class ServingStack(Stack):
         self.predict_url = api.url_for_path("/predict")
 
         CfnOutput(self, "ApiUrl", value=self.predict_url)
+        # A deploy handler that throws leaves the endpoint on the old model.
+        handler_error_alarm(
+            self, "DeployErrors", handler=deploy_fn, slug="deploy", config=config, topic=ops_topic
+        )
+        handler_error_alarm(
+            self, "ProxyErrors", handler=proxy_fn, slug="proxy", config=config, topic=ops_topic
+        )
+
         CfnOutput(self, "EndpointName", value=endpoint_name)
